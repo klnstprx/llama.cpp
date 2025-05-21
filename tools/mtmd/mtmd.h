@@ -179,6 +179,16 @@ MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
 // get output embeddings from the last encode pass
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
+// Encode a single text string into embedding (shared space).
+// Returns 0 on success, non-zero on failure.
+MTMD_API int32_t mtmd_encode_text(mtmd_context * ctx, const char * text);
+
+// Return the dimensionality of each embedding vector (clip_n_mmproj_embd)
+MTMD_API int32_t mtmd_get_embd_dim(mtmd_context * ctx);
+
+// expose underlying clip context for advanced users (experimental)
+MTMD_API struct clip_ctx * mtmd_get_clip_ctx(mtmd_context * ctx);
+
 /////////////////////////////////////////
 
 //

@@ -355,6 +355,12 @@ struct common_params {
     std::string embd_sep   = "\n";  // separator of embeddings
     bool reranking         = false; // enable reranking support on server
 
+    // vision-only image embedding mode
+    // If enabled, the server will start without a language model and will expose
+    // only the /image_embeddings endpoint backed by a SigLIP / CLIP vision
+    // tower loaded via --mmproj.  See tools/server/README for details.
+    bool image_embeddings  = false; // expose only image embedding endpoint
+
     // server params
     int32_t port           = 8080;         // server listens on this network port
     int32_t timeout_read   = 600;          // http read timeout in seconds

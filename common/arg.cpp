@@ -2736,6 +2736,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.reranking = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RERANKING"));
+
+    // Vision-only image embeddings server flag
+    add_opt(common_arg(
+        {"--image-embeddings", "--image_embeddings"},
+        string_format("start server in vision-only mode exposing only /image_embeddings endpoint (default: %s)", params.image_embeddings ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.image_embeddings = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_IMAGE_EMBEDDINGS"));
     add_opt(common_arg(
         {"--api-key"}, "KEY",
         "API key to use for authentication (default: none)",

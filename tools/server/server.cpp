@@ -8,6 +8,8 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
+#include "clip.h"
+#include "base64.hpp"
 
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
@@ -1856,6 +1858,9 @@ struct server_context {
     // multimodal
     mtmd_context * mctx = nullptr;
 
+    // synchronize access to multimodal context for image embedding requests
+    std::mutex mtx_mctx;
+
     const llama_vocab * vocab = nullptr;
 
     llama_model * model_dft = nullptr;
@@ -3567,6 +3572,23 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // -------------------------------------------------------------
+    // Validation for vision-only image embeddings mode
+    // -------------------------------------------------------------
+    if (params.image_embeddings) {
+        // Require multimodal projector to be provided
+        if (params.mmproj.path.empty()) {
+            fprintf(stderr, "error: --image-embeddings requires --mmproj to be specified\n");
+            return 1;
+        }
+
+        // Ignore any automatically-injected default model path so that we can
+        // start without loading a language tower.  We purposefully clear the
+        // struct, instead of erroring, because common_params_parse() fills in
+        // a default path when the user did not explicitly provide one.
+        params.model = {};
+    }
+
     common_init();
 
     // struct that contains llama context and inference
@@ -4705,36 +4727,290 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // register API routes
-    svr->Get ("/health",              handle_health); // public endpoint (no API key check)
-    svr->Get ("/metrics",             handle_metrics);
-    svr->Get ("/props",               handle_props);
-    svr->Post("/props",               handle_props_change);
-    svr->Post("/api/show",            handle_api_show);
-    svr->Get ("/models",              handle_models); // public endpoint (no API key check)
-    svr->Get ("/v1/models",           handle_models); // public endpoint (no API key check)
-    svr->Post("/completion",          handle_completions); // legacy
-    svr->Post("/completions",         handle_completions);
-    svr->Post("/v1/completions",      handle_completions_oai);
-    svr->Post("/chat/completions",    handle_chat_completions);
-    svr->Post("/v1/chat/completions", handle_chat_completions);
-    svr->Post("/infill",              handle_infill);
-    svr->Post("/embedding",           handle_embeddings); // legacy
-    svr->Post("/embeddings",          handle_embeddings);
-    svr->Post("/v1/embeddings",       handle_embeddings_oai);
-    svr->Post("/rerank",              handle_rerank);
-    svr->Post("/reranking",           handle_rerank);
-    svr->Post("/v1/rerank",           handle_rerank);
-    svr->Post("/v1/reranking",        handle_rerank);
-    svr->Post("/tokenize",            handle_tokenize);
-    svr->Post("/detokenize",          handle_detokenize);
-    svr->Post("/apply-template",      handle_apply_template);
-    // LoRA adapters hotswap
-    svr->Get ("/lora-adapters",       handle_lora_adapters_list);
-    svr->Post("/lora-adapters",       handle_lora_adapters_apply);
-    // Save & load slots
-    svr->Get ("/slots",               handle_slots);
-    svr->Post("/slots/:id_slot",      handle_slots_action);
+    // -------------------------------------------------------------
+    // API routes registration
+    // -------------------------------------------------------------
+
+    // Routes that are always available
+    svr->Get("/health", handle_health); // public endpoint (no API key check)
+
+    if (!params.image_embeddings) {
+        // Text-model related routes
+        svr->Get ("/metrics",             handle_metrics);
+        svr->Get ("/props",               handle_props);
+        svr->Post("/props",               handle_props_change);
+        svr->Post("/api/show",            handle_api_show);
+        svr->Get ("/models",              handle_models); // public endpoint (no API key check)
+        svr->Get ("/v1/models",           handle_models); // public endpoint (no API key check)
+        svr->Post("/completion",          handle_completions); // legacy
+        svr->Post("/completions",         handle_completions);
+        svr->Post("/v1/completions",      handle_completions_oai);
+        svr->Post("/chat/completions",    handle_chat_completions);
+        svr->Post("/v1/chat/completions", handle_chat_completions);
+        svr->Post("/infill",              handle_infill);
+        svr->Post("/embedding",           handle_embeddings); // legacy
+        svr->Post("/embeddings",          handle_embeddings);
+        svr->Post("/v1/embeddings",       handle_embeddings_oai);
+    }
+
+    // Image embeddings endpoint (base64 input). Example request body:
+    // {
+    //   "input": ["<base64 image>", ...],
+    //   "encoding_format": "float"|"base64" (optional, default float)
+    // }
+
+    const auto handle_image_embeddings = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
+        if (ctx_server.mctx == nullptr) {
+            res_error(res, format_error_response("Server not started with multimodal projector (--mmproj)", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+
+        const json body = json::parse(req.body);
+
+        json input_json;
+        if (body.count("input") == 0) {
+            res_error(res, format_error_response("\"input\" must be provided", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        input_json = body.at("input");
+
+        bool use_base64_output = false;
+        if (body.count("encoding_format") != 0) {
+            const std::string & fmt = body.at("encoding_format");
+            if (fmt == "base64") {
+                use_base64_output = true;
+            } else if (fmt != "float") {
+                res_error(res, format_error_response("encoding_format must be either 'float' or 'base64'", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
+
+        // Convert input_json to vector of strings
+        std::vector<std::string> inputs;
+        if (input_json.is_string()) {
+            inputs.push_back(input_json.get<std::string>());
+        } else if (input_json.is_array()) {
+            for (const auto & elem : input_json) {
+                if (!elem.is_string()) {
+                    res_error(res, format_error_response("input array must contain base64 strings", ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                inputs.push_back(elem.get<std::string>());
+            }
+        } else {
+            res_error(res, format_error_response("input must be a string or array of strings", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // prepare response array
+        json responses = json::array();
+
+        // lock multimodal context during sequential processing
+        std::lock_guard<std::mutex> lock(ctx_server.mtx_mctx);
+
+        // allocate helpers
+        int32_t embd_dim = mtmd_get_embd_dim(ctx_server.mctx);
+        std::vector<float> embd_norm(embd_dim);
+
+        int idx = 0;
+        for (const auto & b64 : inputs) {
+            // decode base64
+            std::string img_bytes;
+            try {
+                img_bytes = base64::decode(b64, base64::alphabet::auto_, base64::decoding_behavior::moderate);
+            } catch (const std::exception & e) {
+                res_error(res, format_error_response(std::string("Invalid base64 input: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+
+            // load bitmap
+            struct clip_image_u8 * img_u8 = clip_image_u8_init();
+            bool ok_load = clip_image_load_from_bytes(reinterpret_cast<const unsigned char *>(img_bytes.data()), img_bytes.size(), img_u8);
+            if (!ok_load) {
+                res_error(res, format_error_response("Failed to decode image bytes", ERROR_TYPE_INVALID_REQUEST));
+                clip_image_u8_free(img_u8);
+                return;
+            }
+
+            // preprocess
+            struct clip_image_f32_batch * batch_f32 = clip_image_f32_batch_init();
+            struct clip_ctx * clip_ctx_ptr = mtmd_get_clip_ctx(ctx_server.mctx);
+            bool ok_prep = clip_image_preprocess(clip_ctx_ptr, img_u8, batch_f32);
+            if (!ok_prep) {
+                res_error(res, format_error_response("Failed to preprocess image", ERROR_TYPE_SERVER));
+                clip_image_u8_free(img_u8);
+                clip_image_f32_batch_free(batch_f32);
+                return;
+            }
+
+            // allocate embedding buffer (batch encode expects correct size)
+            // Encode single image (batch contains exactly one entry)
+            std::vector<float> embd(embd_dim);
+
+            clip_image_f32 * img_f32 = clip_image_f32_get_img(batch_f32, 0);
+
+            bool ok_enc = clip_image_encode(clip_ctx_ptr, ctx_server.params_base.cpuparams.n_threads, img_f32, embd.data());
+            if (!ok_enc) {
+                res_error(res, format_error_response("Failed to encode image", ERROR_TYPE_SERVER));
+                clip_image_u8_free(img_u8);
+                clip_image_f32_batch_free(batch_f32);
+                return;
+            }
+            // intentionally leak tiny buffers to avoid Metal use-after-free
+
+            // For standard SigLIP mean-pooled output, batch_f32 size is 1 per input image. Use first embd_dim elements.
+            const float * embd_ptr = embd.data();
+
+            // L2-normalize (same as embd_norm=2)
+            common_embd_normalize(embd_ptr, embd_norm.data(), embd_dim, 2);
+
+            json elem;
+            if (use_base64_output) {
+                const char * data_ptr = reinterpret_cast<const char*>(embd_norm.data());
+                size_t data_size = embd_dim * sizeof(float);
+                elem = {
+                    {"embedding", base64::encode(data_ptr, data_size)},
+                    {"index", idx},
+                    {"object", "embedding"},
+                    {"encoding_format", "base64"},
+                    {"tokens_evaluated", 0}
+                };
+            } else {
+                elem = {
+                    {"embedding", std::vector<float>(embd_norm.begin(), embd_norm.end())},
+                    {"index", idx},
+                    {"tokens_evaluated", 0}
+                };
+            }
+
+            responses.push_back(std::move(elem));
+            idx++;
+        }
+
+        bool oaicompat = false;
+        if (req.path.find("/v1/") == 0) {
+            oaicompat = true;
+        }
+
+        if (oaicompat) {
+            json root = format_embeddings_response_oaicompat(body, responses, use_base64_output);
+            res_ok(res, root);
+        } else {
+            res_ok(res, responses);
+        }
+    };
+
+    svr->Post("/image_embeddings", handle_image_embeddings);
+    svr->Post("/v1/image_embeddings", handle_image_embeddings);
+
+    // ---------------------------------------------------------------------
+    // /text_embeddings – encode raw text into shared embedding space
+    // ---------------------------------------------------------------------
+
+    const auto handle_text_embeddings = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
+        if (ctx_server.mctx == nullptr) {
+            res_error(res, format_error_response("Server not started with multimodal projector (--mmproj)", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+
+        const json body = json::parse(req.body);
+        if (!body.contains("input")) {
+            res_error(res, format_error_response("missing 'input' field", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        bool use_base64_output = false;
+        if (body.contains("encoding_format")) {
+            std::string fmt = body["encoding_format"].get<std::string>();
+            if (fmt == "base64") {
+                use_base64_output = true;
+            } else if (fmt != "float") {
+                res_error(res, format_error_response("encoding_format must be 'float' or 'base64'", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
+
+        std::vector<std::string> texts;
+        if (body["input"].is_array()) {
+            for (auto & item : body["input"]) {
+                texts.push_back(item.get<std::string>());
+            }
+        } else {
+            texts.push_back(body["input"].get<std::string>());
+        }
+
+        const int embd_dim = mtmd_get_embd_dim(ctx_server.mctx);
+
+        json responses;
+        int idx = 0;
+
+        std::lock_guard<std::mutex> lock(ctx_server.mtx_mctx);
+
+        for (const std::string & txt : texts) {
+            if (mtmd_encode_text(ctx_server.mctx, txt.c_str()) != 0) {
+                res_error(res, format_error_response("text encoding failed", ERROR_TYPE_SERVER));
+                return;
+            }
+
+            const float * embd_ptr = mtmd_get_output_embd(ctx_server.mctx);
+
+            std::vector<float> embd_norm(embd_dim);
+            common_embd_normalize(embd_ptr, embd_norm.data(), embd_dim, 2);
+
+            json elem;
+            if (use_base64_output) {
+                const char * data_ptr = reinterpret_cast<const char *>(embd_norm.data());
+                size_t data_size = embd_dim * sizeof(float);
+                elem = {
+                    {"embedding", base64::encode(data_ptr, data_size)},
+                    {"index", idx},
+                    {"object", "embedding"},
+                    {"encoding_format", "base64"},
+                    {"tokens_evaluated", 0}
+                };
+            } else {
+                elem = {
+                    {"embedding", std::vector<float>(embd_norm.begin(), embd_norm.end())},
+                    {"index", idx},
+                    {"tokens_evaluated", 0}
+                };
+            }
+
+            responses.push_back(std::move(elem));
+            idx++;
+        }
+
+        bool oaicompat = false;
+        if (req.path.find("/v1/") == 0) {
+            oaicompat = true;
+        }
+
+        if (oaicompat) {
+            json root = format_embeddings_response_oaicompat(body, responses, use_base64_output);
+            res_ok(res, root);
+        } else {
+            res_ok(res, responses);
+        }
+    };
+
+    svr->Post("/text_embeddings",      handle_text_embeddings);
+    svr->Post("/v1/text_embeddings",   handle_text_embeddings);
+
+    if (!params.image_embeddings) {
+        svr->Post("/rerank",              handle_rerank);
+        svr->Post("/reranking",           handle_rerank);
+        svr->Post("/v1/rerank",           handle_rerank);
+        svr->Post("/v1/reranking",        handle_rerank);
+        svr->Post("/tokenize",            handle_tokenize);
+        svr->Post("/detokenize",          handle_detokenize);
+        svr->Post("/apply-template",      handle_apply_template);
+        // LoRA adapters hotswap
+        svr->Get ("/lora-adapters",       handle_lora_adapters_list);
+        svr->Post("/lora-adapters",       handle_lora_adapters_apply);
+        // Save & load slots
+        svr->Get ("/slots",               handle_slots);
+        svr->Post("/slots/:id_slot",      handle_slots_action);
+    }
 
     //
     // Start the server
@@ -4786,6 +5062,45 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: HTTP server is listening, hostname: %s, port: %d, http threads: %d\n", __func__, params.hostname.c_str(), params.port, params.n_threads_http);
 
+    if (params.image_embeddings) {
+        // ---------------------------------------------------------
+        // Vision-only path: load multimodal projector only
+        // ---------------------------------------------------------
+
+        ctx_server.params_base = params;
+
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu       = params.mmproj_use_gpu;
+        mparams.print_timings = false;
+        mparams.n_threads     = params.cpuparams.n_threads;
+        mparams.verbosity     = params.verbosity > 0 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
+
+        const std::string & mmproj_path = params.mmproj.path;
+        ctx_server.mctx = mtmd_init_from_file(mmproj_path.c_str(), /*text_model=*/nullptr, mparams);
+        if (ctx_server.mctx == nullptr) {
+            LOG_ERR("%s: failed to load multimodal projector from '%s'\n", __func__, mmproj_path.c_str());
+            clean_up();
+            t.join();
+            return 1;
+        }
+
+        state.store(SERVER_STATE_READY);
+
+        // Handle shutdown (SIGINT / SIGTERM)
+        shutdown_handler = [&](int) {
+            svr->stop();
+        };
+
+        // Block main thread until HTTP server stops
+        t.join();
+        clean_up();
+        return 0;
+    }
+
+    // ---------------------------------------------------------
+    // Standard path (text model)
+    // ---------------------------------------------------------
+
     // load the model
     LOG_INF("%s: loading model\n", __func__);
 
@@ -4818,7 +5133,6 @@ int main(int argc, char ** argv) {
         // this will unblock start_loop()
         ctx_server.queue_tasks.terminate();
     };
-
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;

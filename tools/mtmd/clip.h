@@ -90,6 +90,17 @@ struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, struct clip_image_f32 * img, float * vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, float * vec);
 
+// --- text encoder -----------------------------------------------------------
+
+// Encode a sequence of WordPiece token ids (tokens, length n_tokens)
+// into a dense vector of dimension clip_n_mmproj_embd(ctx).
+// Returns true on success.
+bool clip_text_encode(struct clip_ctx * ctx, int n_threads,
+                      const int32_t * tokens, int n_tokens, float * vec);
+
+// Expose underlying GGUF context (read-only) – for tokenizer setups
+struct gguf_context * clip_get_gguf(struct clip_ctx * ctx);
+
 int clip_is_minicpmv(const struct clip_ctx * ctx);
 bool clip_is_glm(const struct clip_ctx * ctx);
 bool clip_is_qwen2vl(const struct clip_ctx * ctx);

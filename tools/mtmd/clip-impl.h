@@ -108,6 +108,7 @@ enum projector_type {
     PROJECTOR_TYPE_GEMMA3,
     PROJECTOR_TYPE_IDEFICS3,
     PROJECTOR_TYPE_PIXTRAL,
+    PROJECTOR_TYPE_NONE,
     PROJECTOR_TYPE_QWEN25VL,
     PROJECTOR_TYPE_INTERNVL,
     PROJECTOR_TYPE_UNKNOWN,
@@ -124,6 +125,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GEMMA3,    "gemma3"},
     { PROJECTOR_TYPE_IDEFICS3,  "idefics3"},
     { PROJECTOR_TYPE_PIXTRAL,   "pixtral"},
+    { PROJECTOR_TYPE_NONE,      "none"},
     { PROJECTOR_TYPE_INTERNVL,  "internvl"},
 };
 

@@ -3,6 +3,7 @@
 #include "mtmd.h"
 
 #include "llama.h"
+#include "src/unicode.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+#include <unordered_map>
 
 // represents raw image data, layout is RGBRGBRGB...
 // length of data must be nx * ny * 3
@@ -63,6 +65,12 @@ struct mtmd_context {
     bool print_timings;
     int n_threads;
     std::string image_marker;
+
+    // Text embedding support ---------------------------------------------
+    std::unordered_map<std::string,int> token_to_id;
+    std::vector<std::string>            id_to_token;
+    int                                 unk_id = 0;
+    std::vector<float>                  text_embd_v; // latest text embedding
 
     // for minicpmv, we need special tokens in-between slices
     mtmd_slice_tmpl slice_tmpl    = MTMD_SLICE_TMPL_NONE;
@@ -459,6 +467,137 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
 
 float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
+}
+
+int32_t mtmd_get_embd_dim(mtmd_context * ctx) {
+    return clip_n_mmproj_embd(ctx->ctx_clip);
+}
+
+clip_ctx * mtmd_get_clip_ctx(mtmd_context * ctx) {
+    return ctx->ctx_clip;
+}
+
+// -----------------------------------------------------------------------------
+// Simple WordPiece tokenization utilities (subset of llm_tokenizer_wpm_session)
+// -----------------------------------------------------------------------------
+
+static std::vector<std::string> wpm_preprocess(const std::string & text) {
+    const std::vector<uint32_t> cpts_nfd = unicode_cpts_normalize_nfd(unicode_cpts_from_utf8(text));
+    std::vector<std::string> words(1, "");
+
+    auto is_chinese_char = [](uint32_t cpt) {
+        return (cpt >= 0x04E00 && cpt <= 0x09FFF) ||
+               (cpt >= 0x03400 && cpt <= 0x04DBF) ||
+               (cpt >= 0x20000 && cpt <= 0x2A6DF) ||
+               (cpt >= 0x2A700 && cpt <= 0x2B73F) ||
+               (cpt >= 0x2B740 && cpt <= 0x2B81F) ||
+               (cpt >= 0x2B920 && cpt <= 0x2CEAF) ||
+               (cpt >= 0x0F900 && cpt <= 0x0FAFF) ||
+               (cpt >= 0x2F800 && cpt <= 0x2FA1F);
+    };
+
+    for (uint32_t cpt : cpts_nfd) {
+        auto flags = unicode_cpt_flags_from_cpt(cpt);
+        if (flags.is_whitespace) {
+            if (words.back().size()) {
+                words.emplace_back();
+            }
+            continue;
+        }
+        if (cpt == 0 || cpt == 0xFFFD || flags.is_control) {
+            continue;
+        }
+        std::string s = unicode_cpt_to_utf8(unicode_tolower(cpt));
+        if (flags.is_punctuation || (cpt < 0x7F && flags.is_symbol) || is_chinese_char(cpt)) {
+            if (words.back().size()) {
+                words.emplace_back();
+            }
+            words.back() = s;
+            words.emplace_back();
+        } else {
+            words.back() += s;
+        }
+    }
+    if (!words.back().size()) {
+        words.pop_back();
+    }
+    return words;
+}
+
+static bool wpm_tokenize(const std::unordered_map<std::string,int> & vocab,
+                         int unk_id,
+                         const std::string & text,
+                         std::vector<int32_t> & out_tokens) {
+    out_tokens.clear();
+    std::vector<std::string> words = wpm_preprocess(text);
+
+    for (const std::string & word_raw : words) {
+        if (word_raw.empty()) continue;
+
+        const std::string word = "\xE2\x96\x81" + word_raw; // phantom space prefix
+        const int n = word.size();
+
+        size_t current_size = out_tokens.size();
+        for (int i = 0; i < n; ++i) {
+            bool match = false;
+            for (int j = std::min(n, i + 100); j > i; --j) { // 100 is max token len fallback
+                auto it = vocab.find(word.substr(i, j - i));
+                if (it != vocab.end()) {
+                    out_tokens.push_back(it->second);
+                    match = true;
+                    i = j - 1;
+                    break;
+                }
+            }
+            if (!match) {
+                out_tokens.resize(current_size);
+                break; // discard word
+            }
+        }
+        if (current_size == out_tokens.size()) {
+            out_tokens.push_back(unk_id);
+        }
+    }
+    return !out_tokens.empty();
+}
+
+int32_t mtmd_encode_text(mtmd_context * ctx, const char * text_cstr) {
+    if (text_cstr == nullptr) return 1;
+    if (ctx->ctx_clip == nullptr) return 1;
+
+    // Build vocab on first call
+    if (ctx->token_to_id.empty()) {
+        gguf_context * gg = clip_get_gguf(ctx->ctx_clip);
+        int keyidx = gguf_find_key(gg, "tokenizer.ggml.tokens");
+        if (keyidx < 0) {
+            LOG_ERR("%s: tokenizer tokens not found in gguf\n", __func__);
+            return 2;
+        }
+        int n_tok = gguf_get_arr_n(gg, keyidx);
+        ctx->id_to_token.resize(n_tok);
+        for (int i = 0; i < n_tok; ++i) {
+            std::string tok = gguf_get_arr_str(gg, keyidx, i);
+            ctx->id_to_token[i] = tok;
+            ctx->token_to_id[tok] = i;
+        }
+        // guess unk id – look for "[UNK]" or token with text "[UNK]"
+        ctx->unk_id = 0;
+        auto it_unk = ctx->token_to_id.find("[UNK]");
+        if (it_unk != ctx->token_to_id.end()) {
+            ctx->unk_id = it_unk->second;
+        }
+    }
+
+    std::vector<int32_t> tokens;
+    if (!wpm_tokenize(ctx->token_to_id, ctx->unk_id, text_cstr, tokens)) {
+        return 3;
+    }
+
+    int embd_dim = clip_n_mmproj_embd(ctx->ctx_clip);
+    ctx->image_embd_v.resize(embd_dim); // reuse same vector for output consistency
+
+    bool ok = clip_text_encode(ctx->ctx_clip, ctx->n_threads, tokens.data(), tokens.size(), ctx->image_embd_v.data());
+    return ok ? 0 : 4;
 }
 
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
